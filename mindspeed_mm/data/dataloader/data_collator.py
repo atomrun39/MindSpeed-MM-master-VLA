@@ -211,10 +211,28 @@ class DataCollatorForVLASequence:
         process_args = ProcessorArguments(**dataset_param.preprocess_parameters.to_dict())
         tokenizer_module = load_tokenizer(process_args)
         self.pad_token_id = tokenizer_module.get('tokenizer').pad_token_id
+        self.fixed_seq_length = kwargs.get("fixed_seq_length", None)
+        if self.fixed_seq_length is None:
+            try:
+                args = get_args()
+                self.fixed_seq_length = getattr(args, "seq_length", None)
+            except Exception:
+                self.fixed_seq_length = None
+        if self.fixed_seq_length is not None:
+            self.fixed_seq_length = int(self.fixed_seq_length)
+            if self.fixed_seq_length <= 0:
+                self.fixed_seq_length = None
 
     def __call__(self, features):
         input_ids = [_to_tensor(f["input_ids"]).squeeze(0) for f in features]
         input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
+        if self.fixed_seq_length is not None:
+            seq_len = input_ids.shape[1]
+            if seq_len > self.fixed_seq_length:
+                input_ids = input_ids[:, :self.fixed_seq_length]
+            elif seq_len < self.fixed_seq_length:
+                pad_width = self.fixed_seq_length - seq_len
+                input_ids = F.pad(input_ids, (0, pad_width), value=self.pad_token_id)
         attention_mask = input_ids.ne(self.pad_token_id)
 
         batch = {

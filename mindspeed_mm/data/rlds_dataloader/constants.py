@@ -5,6 +5,8 @@ VLA（Vision-Language-Action）训练与评估所需的关键常量。
 若无法识别，则默认使用 G1_EE_6D（宇树G1机器人末端执行器6D位姿控制模式）的常量。
 """
 
+import json
+import os
 import sys
 from enum import Enum
 
@@ -182,6 +184,10 @@ def detect_robot_platform():
     python train.py --robot_platform=libero → 检测到"libero" → 返回"LIBERO"
     python eval.py --dataset=aloha_test   → 检测到"aloha"  → 返回"ALOHA"
     """
+    env_platform = os.getenv("VLA_ROBOT_PLATFORM", "").strip().upper()
+    if env_platform in {"LIBERO", "ALOHA", "BRIDGE", "FRACTAL", "G1_EE_6D", "G1", "G1_STACK_BLOCK"}:
+        return env_platform
+
     # 把所有命令行参数（包括脚本名和--xxx=yyy）用空格连接
     # 例如: ['train.py', '--robot_platform=libero', '--batch_size=8']
     # 变成: "train.py --robot_platform=libero --batch_size=8"

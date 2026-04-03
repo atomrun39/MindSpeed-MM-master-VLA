@@ -1,5 +1,6 @@
 import argparse
 import importlib
+import os
 from typing import Any, Dict
 
 import torch
@@ -27,6 +28,12 @@ class RLDSVLAAdapterDataset(IterableDataset):
         train = basic_param.get("train", True)
         data_root_dir = basic_param.get("data_root_dir")
         data_mix = basic_param.get("data_mix")
+        env_data_root_dir = os.getenv("VLA_DATA_ROOT_DIR") or os.getenv("OXE_DATA_ROOT")
+        env_data_mix = os.getenv("VLA_DATA_MIX") or os.getenv("DATA_MIX")
+        if env_data_root_dir:
+            data_root_dir = env_data_root_dir
+        if env_data_mix:
+            data_mix = env_data_mix
         if data_root_dir is None or data_mix is None:
             raise ValueError("basic_parameters.data_root_dir and basic_parameters.data_mix are required for rlds_vla dataset.")
 

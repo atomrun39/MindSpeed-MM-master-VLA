@@ -27,6 +27,7 @@ from mindspeed_mm.models.common.module_spec.get_layer_spec import get_vit_layer_
     get_projector_layer_spec, get_audio_layer_spec
 from mindspeed_mm.models.vision.vision_model import VisionModel
 from mindspeed_mm.models.audio.audio_model import AudioModel
+from mindspeed_mm.models.action import ActionHead, FlowmatchingActionHead
 from mindspeed_mm.models.common.module import MultiModalModule
 from mindspeed_mm.models.text_encoder.text_encoder import TextEncoder
 from mindspeed_mm.models.common.mm_gpt_model import MMGPTModel
@@ -54,7 +55,6 @@ class VLMModel(MultiModalModule, FSDP2Mixin, WeightInitMixin):
         {
             "pre_process": (bool),  # Include the embedding leayer in the gpt decoder (used with pipeline parallelism).
             "post_process": (bool),  # Include an output layer and a layernorm in the gpt decoder (used with pipeline parallelism).
-            "add_text_encoder": (bool),  # Whether to construct the text encoder. not used now.
             "reward_process: (bool, optional), # Without an output layer in the gpt decoder (only used with videoalign). Defaults to False.
             "add_text_encoder": (bool),  # Whether to construct the text encoder. not used now.
             "add_image_encoder": (bool),  # Whether to construct the image encoder.
@@ -72,27 +72,47 @@ class VLMModel(MultiModalModule, FSDP2Mixin, WeightInitMixin):
         super().__init__(config=config)
         args = get_args()
 
+        # 从全局args生成megatron core所需的config对象
         self.config = core_transformer_config_from_args(args)
+        # 是否包含embedding层（用于pipeline并行）
         self.pre_process: bool = config.pre_process
+        # 是否包含输出层+layernorm（用于pipeline并行）
         self.post_process: bool = config.post_process
+        # 是否仅用于reward model（无输出层，videoalign场景）
         self.reward_process: bool = getattr(config, 'reward_process', False)
+
+        # 各编码器/解码器开关
         self.add_text_encoder = config.text_encoder is not None
         self.add_image_encoder = config.image_encoder is not None
         self.add_video_encoder = config.video_encoder is not None
         self.add_text_decoder = config.text_decoder is not None
+        # 音频编码器开关（可选配置）
         self.add_audio_encoder = hasattr(config, "audio_encoder") and config.audio_encoder is not None
 
+        # 子模块占位符
         self.text_encoder = None
         self.image_encoder = None
         self.video_encoder = None
         self.text_decoder = None
+        self.action_head = None
 
+        # 是否共享词嵌入与输出权重（默认共享）
         self.share_embeddings_and_output_weights = not getattr(config.text_decoder,
                                                                'untie_embeddings_and_output_weights', True)
+        # 图像token在文本序列中的插入位置
         self.img_context_token_id = config.img_context_token_id
+        # 视觉起始token id（可选）
         self.vision_start_token_id = getattr(config, "vision_start_token_id", None)
+        # ActionHead配置（可选）
+        self.action_head_config = getattr(config, "action_head", None)
+        # 是否启用ActionHead：需配置存在、enable=True且当前stage为post_process
+        self.enable_action_head = bool(
+            self.action_head_config is not None
+            and getattr(self.action_head_config, "enable", False)
+            and self.post_process
+        )
 
-        # initialize pipeline parallel configs
+        # 初始化pipeline并行相关参数
         self.pp_size = mpu.get_pipeline_model_parallel_world_size()
         self.enable_vp = mpu.get_virtual_pipeline_model_parallel_world_size() is not None
         if self.enable_vp:
@@ -100,19 +120,28 @@ class VLMModel(MultiModalModule, FSDP2Mixin, WeightInitMixin):
             self.vp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
         self.pp_rank = mpu.get_pipeline_model_parallel_rank()
 
+        # 根据开关构建各子模型
         if self.add_text_encoder:
             self.text_encoder = TextEncoder(config.text_encoder).get_model()
         if self.add_image_encoder:
+            # 构建图像编码器（含ViT+Projector）
             self.image_encoder = self._build_image_encoder_model(config.image_encoder)
         if self.add_video_encoder:
             raise NotImplementedError("Not support video_encoder now")
         if self.add_text_decoder:
+            # 记录文本解码器所需参数
             self.position_embedding_type = config.text_decoder.position_embedding_type
             self.vocab_size = config.text_decoder.vocab_size
+            # 构建文本解码器（MMGPTModel）
             self.text_decoder = self._build_text_decoder_model(config.text_decoder)
+            # 若启用ActionHead，则构建
+            if self.enable_action_head:
+                self.action_head = self._build_action_head(config.text_decoder.hidden_size)
         if self.add_audio_encoder:
+            # 构建音频编码器
             self.audio_encoder = self._build_audio_encoder_model(config.audio_encoder)
 
+        # 若为异构并行，切回text_decoder的并行状态
         if args.hetero_parallel:
             change_parallel_state('text_decoder')
 
@@ -369,6 +398,12 @@ class VLMModel(MultiModalModule, FSDP2Mixin, WeightInitMixin):
             reward_process=self.reward_process
         )
 
+    def _build_action_head(self, text_hidden_size: int):
+        action_head_type = str(getattr(self.action_head_config, "type", "mlp")).lower()
+        if action_head_type in {"flowmatching", "flow_matching", "flowmatching_dit", "dit", "dit_l"}:
+            return FlowmatchingActionHead(self.action_head_config, text_hidden_size=text_hidden_size)
+        return ActionHead(self.action_head_config, text_hidden_size=text_hidden_size)
+
     def set_input_tensor(self, input_tensor):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
@@ -575,45 +610,55 @@ class VLMModel(MultiModalModule, FSDP2Mixin, WeightInitMixin):
 
     def forward(
             self,
-            input_ids: torch.Tensor,
-            pixel_values: Optional[torch.Tensor] = None,
-            image_grid_thw: Optional[torch.Tensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            labels: Optional[torch.Tensor] = None,
-            inference_params: Optional[InferenceParams] = None,
-            decoder_input: Optional[torch.FloatTensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            packed_seq_params: Optional[PackedSeqParams] = None,
-            extra_block_kwargs: Optional[dict] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            rope_deltas: Optional[torch.LongTensor] = None,
-            image_flags: Optional[torch.LongTensor] = None,
-            transfer: Optional[numpy.ndarray] = None,
+            input_ids: torch.Tensor,               # 文本 token id，形状 [batch, seq]
+            pixel_values: Optional[torch.Tensor] = None,          # 图像像素值，形状 [num_images, C, H, W]
+            image_grid_thw: Optional[torch.Tensor] = None,      # 每张图像的 token 网格形状 (T, H, W)
+            attention_mask: Optional[torch.Tensor] = None,       # 注意力掩码
+            labels: Optional[torch.Tensor] = None,               # 语言模型训练标签，形状 [batch, seq]
+            inference_params: Optional[InferenceParams] = None,# 推理时缓存参数
+            decoder_input: Optional[torch.FloatTensor] = None,  # 已废弃，兼容旧接口
+            position_ids: Optional[torch.LongTensor] = None,    # 位置 id，用于 RoPE
+            packed_seq_params: Optional[PackedSeqParams] = None,# 打包序列参数
+            extra_block_kwargs: Optional[dict] = None,          # 传入 TransformerBlock 的额外参数
+            cache_position: Optional[torch.LongTensor] = None,  # 缓存位置，用于增量推理
+            rope_deltas: Optional[torch.LongTensor] = None,     # RoPE 增量，用于图像 token
+            image_flags: Optional[torch.LongTensor] = None,   # 图像有效标志，0 表示占位图
+            transfer: Optional[numpy.ndarray] = None,         # 用于 encoder_dp_balance 的通信张量
             *args, **kwargs
     ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
+        """
+        多模态前向入口：
+        1. 若开启 hetero_pp 且当前 stage 不属于 image_encoder，则直接返回图像/音频嵌入供下游 stage 使用；
+        2. 若 llm_only=True，跳过图像编码，直接使用外部传入的 vit_embeds；
+        3. 若 vit_only=True，仅做图像编码并返回 vit_embeds；
+        4. 否则走正常流程：图像编码 -> 音频编码 -> 文本解码 -> 计算损失。
+        """
 
-        # hetero pipeline use
+        # ---------------- 异构流水线标记 ----------------
+        # 当开启 hetero_pp 且当前进程组不属于 image_encoder 时，后续逻辑会提前返回
         hetero_pp = hasattr(mpu, "_IS_HETERO_PP_MOUDLE") and mpu._IS_HETERO_PP_MOUDLE
 
-        # MM_GRPO use, if llm_only is True, directly get vit_embeds
+        # ---------------- 图像编码分支 ----------------
         deepstack_visual_embeds = None
         if self.add_image_encoder and self.image_encoder.pre_process and kwargs.get('llm_only', False):
+            # MM_GRPO 场景：仅 LLM 阶段，直接拿外部 vit_embeds
             vit_embeds = kwargs.get('vit_embeds').unsqueeze(1)
         elif self.add_image_encoder and pixel_values is not None and not hetero_pp:
+            # 正常图像编码路径
             text_img_num = (input_ids == self.vision_start_token_id).sum(dim=1) if get_args().hetero_parallel else None
             encoder_out = self.image_encoder(pixel_values, image_grid_thw, text_img_num)
+            # 支持返回多层视觉特征（deepstack）
             if isinstance(encoder_out, tuple) and len(encoder_out) == 2:
                 vit_embeds, deepstack_image_embeds = encoder_out
                 kwargs["deepstack_image_embeds"] = deepstack_image_embeds
             else:
                 vit_embeds = encoder_out
-            if get_args().encoder_dp_balance and self.encoder_dp_enable:
-                vit_embeds = EncoderBalanceComm.apply(
-                    vit_embeds,
-                    mpu.get_data_parallel_group(),
-                    transfer
-                )
 
+            # 可选：在数据并行组间做负载均衡通信
+            if get_args().encoder_dp_balance and self.encoder_dp_enable:
+                vit_embeds = EncoderBalanceComm.apply(vit_embeds, mpu.get_data_parallel_group(), transfer)
+
+            # 根据 image_flags 过滤无效图像
             if image_flags is not None:
                 if self.image_encoder.post_process:
                     image_flags = image_flags.squeeze(-1)
@@ -623,46 +668,53 @@ class VLMModel(MultiModalModule, FSDP2Mixin, WeightInitMixin):
                 vit_embeds = vit_embeds.reshape(-1, 1, vit_embeds.shape[-1]).clone()
             output = vit_embeds
         else:
+            # 非图像 stage 或 hetero_pp 场景，从上游接收
             vit_embeds = self.input_tensor
 
-        # MM_GRPO use, if vit_only is True, only calculate vit_embeds and return
+        # MM_GRPO 场景：仅视觉编码阶段，提前返回
         if kwargs.get('vit_only', False) and self.image_encoder.post_process:
             return {"vit_embeds": vit_embeds}
-        
+
+        # ---------------- 音频编码分支 ----------------
         audio_embeds = None
         if self.add_audio_encoder and 'input_features' in kwargs and not hetero_pp:
             audio_embeds = self.audio_encoder(kwargs['input_features'], kwargs['feature_attention_mask'])
-        
-        # hetero pipeline use
+
+        # ---------------- 异构流水线：提前返回 ----------------
         if hasattr(mpu, "_IS_HETERO_PP_MOUDLE") and not mpu._IS_HETERO_PP_MOUDLE:
             change_parallel_state('image_encoder')
-            return [vit_embeds, audio_embeds] 
+            return [vit_embeds, audio_embeds]   # 供下游 text_decoder stage 使用
 
+        # ---------------- 文本解码 & 损失计算 ----------------
         if self.add_text_decoder:
+            action_pred = None
+            action_loss = None
             if self.text_decoder.pre_process:
+                # 1. 取文本嵌入
                 input_embeds = self.text_decoder.embedding(input_ids=input_ids, position_ids=position_ids).clone()
+                # 支持外部直接传入多模态嵌入（MM_GRPO）
                 if kwargs.get('vit_embedings') is not None or kwargs.get('audio_embedings') is not None:
-                    vit_embeds = kwargs.get('vit_embedings')
+                    vit_embeds   = kwargs.get('vit_embedings')
                     audio_embeds = kwargs.get('audio_embedings')
-                input_embeds, deepstack_visual_embeds = self.process_multimodal_embeddings(input_embeds, input_ids, 
-                                                                                           vit_embeds, audio_embeds,
-                                                                                           **kwargs)
+                # 2. 将图像/音频嵌入拼接到对应 token 位置
+                input_embeds, deepstack_visual_embeds = self.process_multimodal_embeddings(
+                    input_embeds, input_ids, vit_embeds, audio_embeds, **kwargs)
             else:
                 input_embeds = None
 
-            attention_mask, position_ids = prepare_positionsids_mask_for_llm(config=self.config, input_ids=input_ids,
-                                                                             inference_params=inference_params,
-                                                                             attention_mask=attention_mask,
-                                                                             position_ids=position_ids,
-                                                                             image_grid_thw=image_grid_thw,
-                                                                             rope_deltas=rope_deltas,
-                                                                             inputs_embeds=input_embeds,
-                                                                             cache_position=cache_position,
-                                                                             **kwargs)
+            # 3. 构造 attention_mask & position_ids（含图像 token 偏移）
+            attention_mask, position_ids = prepare_positionsids_mask_for_llm(
+                config=self.config, input_ids=input_ids, inference_params=inference_params,
+                attention_mask=attention_mask, position_ids=position_ids,
+                image_grid_thw=image_grid_thw, rope_deltas=rope_deltas,
+                inputs_embeds=input_embeds, cache_position=cache_position, **kwargs)
+
+            # 4. 组装 deepstack 特征
             extra_block_kwargs = {}
             if deepstack_visual_embeds is not None and len(deepstack_visual_embeds) > 0:
                 extra_block_kwargs['deepstack_visual_embeds'] = deepstack_visual_embeds
 
+            # 5. 文本模型前向
             output = self.text_decoder(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -671,28 +723,51 @@ class VLMModel(MultiModalModule, FSDP2Mixin, WeightInitMixin):
                 labels=None,
                 inference_params=inference_params,
                 extra_block_kwargs=extra_block_kwargs,
+                output_hidden_states=self.enable_action_head,
             )
 
+            # 6. 后处理：取 logits / hidden_states / 计算损失
             if self.text_decoder.post_process:
+                hidden_states = None
+                if isinstance(output, dict):
+                    hidden_states = output.get("hidden_states")
+                    output = output["logits"]
+
                 output = output.contiguous().float()
+
+                # 可选：动作头推理
+                if self.action_head is not None and hidden_states is not None:
+                    action_state = kwargs.get("state", kwargs.get("action_state"))
+                    action_target = kwargs.get("action", kwargs.get("actions"))
+                    compute_action_loss = self.training or bool(kwargs.get("compute_action_loss", False))
+                    if hasattr(self.action_head, "compute_loss") and action_target is not None and compute_action_loss:
+                        repeated_steps = int(getattr(self.action_head_config, "repeated_diffusion_steps", 1))
+                        action_loss = self.action_head.compute_loss(
+                            hidden_states=hidden_states,
+                            actions=action_target,
+                            state=action_state,
+                            repeated_diffusion_steps=repeated_steps,
+                        )
+                    if (not self.training) or bool(kwargs.get("return_action_pred", False)):
+                        action_pred = self.action_head(hidden_states, state=action_state)
+
                 loss_dict = {}
                 if labels is not None:
+                    # 上下文并行损失
                     if mpu.get_context_parallel_world_size() > 1:
                         loss, token_nums = self.compute_loss_with_context_parallel(output, labels)
-
                         loss_dict["loss"] = loss
                         loss_dict["token_nums"] = token_nums
-
                         return {
                             "loss_dict": loss_dict,
-                            "logits": output
+                            "logits": output,
+                            "action_pred": action_pred,
+                            "action_loss": action_loss
                         }
                     else:
-                        # output shape [b, s, vocab_size]
+                        # 普通/TP 损失
                         shift_logits = output[..., :-1, :].contiguous()
-                        # labels shape [b, s]
                         shift_labels = labels[..., 1:].contiguous()
-
                         if mpu.get_tensor_model_parallel_world_size() > 1:
                             loss = self.compute_loss_with_tensor_parallel(shift_logits, shift_labels)
                         else:
@@ -700,15 +775,20 @@ class VLMModel(MultiModalModule, FSDP2Mixin, WeightInitMixin):
 
                         loss_dict["loss"] = loss
                         loss_dict["loss_mask"] = shift_labels > -1
-
                         return {
                             "loss_dict": loss_dict,
-                            "logits": output
+                            "logits": output,
+                            "action_pred": action_pred,
+                            "action_loss": action_loss
                         }
 
+                # 推理阶段无标签
                 return {
                     "loss": None,
-                    "logits": output
+                    "logits": output,
+                    "action_pred": action_pred,
+                    "action_loss": action_loss
                 }
 
+        # 非 text_decoder stage，直接返回上游结果
         return output

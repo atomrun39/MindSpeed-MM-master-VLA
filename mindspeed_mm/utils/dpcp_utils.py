@@ -293,11 +293,19 @@ def data_aware_parallel_optimize(data_iterator):
 
             CACHED_BATCH.append(batch)
 
-
 def is_use_dynamic_dpcp():
+    """
+    判断当前是否启用了“动态 DP/CP”并行策略切换功能。
+    依次检查：
+      1. 全局 args 中是否存在 mm 配置；
+      2. mm 下是否存在 model 配置；
+      3. model 下是否存在 use_dynamic_dpcp 字段且其值为 True。
+    若以上条件全部满足，则返回 True，否则返回 False。
+    """
     args = get_args()
-    return hasattr(args.mm.model, "use_dynamic_dpcp") and args.mm.model.use_dynamic_dpcp
-
+    mm_cfg = getattr(args, "mm", None)
+    model_cfg = getattr(mm_cfg, "model", None) if mm_cfg is not None else None
+    return bool(model_cfg is not None and hasattr(model_cfg, "use_dynamic_dpcp") and model_cfg.use_dynamic_dpcp)
 
 def get_max_cp_size():
     args = get_args()

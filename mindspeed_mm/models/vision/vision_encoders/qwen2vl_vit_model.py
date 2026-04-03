@@ -45,7 +45,7 @@ def rotate_half(x):
 
 
 # Modified based on transformers.models.qwen2_vl.modeling_qwen2_vl
-def apply_multimodal_rotary_pos_emb(q, k, cos, sin, use_fused_rope=True):
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, use_fused_rope=False):
     if use_fused_rope:
         q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
         k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
@@ -56,7 +56,7 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, use_fused_rope=True):
 
 
 # Modified based on transformers.models.qwen2_vl.modeling_qwen2_vl
-def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor, use_fused_rope=True) -> torch.Tensor:
+def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor, use_fused_rope=False) -> torch.Tensor:
     orig_dtype = tensor.dtype
     tensor = tensor.float()
     cos, sin = torch.chunk(freqs, 2, dim=0)
@@ -460,8 +460,8 @@ class Qwen2VLViT(MultiModalModule):
                 grid_w // self.spatial_merge_size,
             )
             index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(grid_t, llm_grid_h, llm_grid_w)
-            pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
-            pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+            pad_h = (vit_merger_window_size - llm_grid_h % vit_merger_window_size) % vit_merger_window_size
+            pad_w = (vit_merger_window_size - llm_grid_w % vit_merger_window_size) % vit_merger_window_size
             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
             index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
@@ -504,57 +504,71 @@ class Qwen2VLViT(MultiModalModule):
         else:
             hidden_states = None
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        seq_len = hidden_states.shape[0] if hidden_states is not None else pixel_values.shape[-2]
+        # 只在 pre_process 阶段生成 rotary_pos_emb
+        # 在 Pipeline Parallel 中，rotary_pos_emb 会通过 self.blocks 传递给后续的 stage
+        if self.pre_process:
+            rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        else:
+            rotary_pos_emb = None
+            
+        seq_len = hidden_states.shape[0]
         window_index = None
         window_mask = None
         cu_window_seqlens = None
         if getattr(self.config, 'window_attn_size', None) is not None:
             if getattr(self.config, 'fullatt_block_indexes', None) is None:
                 raise ValueError("The 'fullatt_block_indexes' attribute is required when using 'window_attn_size'.")
-            window_index, cu_window_seqlens = self.get_window_index(grid_thw)
-            cu_window_seqlens = torch.tensor(
-                cu_window_seqlens,
-                device=grid_thw.device,
-                dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-            )
-            cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
-
-            spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
-            if self.pre_process:
-                hidden_states = hidden_states.squeeze(1)
-                hidden_states = hidden_states.reshape(seq_len // spatial_merge_unit, spatial_merge_unit, -1)
-                hidden_states = hidden_states[window_index, :, :]
-                hidden_states = hidden_states.reshape(seq_len, -1)
-                hidden_states = hidden_states.unsqueeze(1)
-
-            rotary_pos_emb = rotary_pos_emb.reshape(seq_len // spatial_merge_unit, spatial_merge_unit, -1)
-            rotary_pos_emb = rotary_pos_emb[window_index, :, :]
-            rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-
-            if not get_args().use_flash_attn:
-                window_mask = torch.full(
-                    [1, seq_len, seq_len], torch.finfo(pixel_values.dtype).min, device=pixel_values.device,
-                    dtype=torch.bool
+            if grid_thw is not None:
+                window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+                cu_window_seqlens = torch.tensor(
+                    cu_window_seqlens,
+                    device=grid_thw.device,
+                    dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
                 )
-                for i in range(1, len(cu_window_seqlens)):
-                    window_mask[..., cu_window_seqlens[i - 1]: cu_window_seqlens[i], cu_window_seqlens[i - 1]: cu_window_seqlens[i]] = 0
+                cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
 
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0, dtype=torch.int32
-        )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+                spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+                if self.pre_process:
+                    hidden_states = hidden_states.squeeze(1)
+                    hidden_states = hidden_states.reshape(seq_len // spatial_merge_unit, spatial_merge_unit, -1)
+                    hidden_states = hidden_states[window_index, :, :]
+                    hidden_states = hidden_states.reshape(seq_len, -1)
+                    hidden_states = hidden_states.unsqueeze(1)
+
+                    rotary_pos_emb = rotary_pos_emb.reshape(seq_len // spatial_merge_unit, spatial_merge_unit, -1)
+                    rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+                    rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+
+                if not get_args().use_flash_attn:
+                    window_mask = torch.full(
+                        [1, seq_len, seq_len], torch.finfo(pixel_values.dtype).min, device=pixel_values.device,
+                        dtype=torch.bool
+                    )
+                    for i in range(1, len(cu_window_seqlens)):
+                        window_mask[..., cu_window_seqlens[i - 1]: cu_window_seqlens[i], cu_window_seqlens[i - 1]: cu_window_seqlens[i]] = 0
+
+        if grid_thw is not None:
+            cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+                dim=0, dtype=torch.int32
+            )
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        else:
+            cu_seqlens = None
 
         if get_args().use_flash_attn:
             attention_mask = None
             window_mask = None
         else:
-            attention_mask = torch.full(
-                [1, seq_len, seq_len], torch.finfo(pixel_values.dtype).min, device=pixel_values.device,
-                dtype=torch.bool
-            )
-            for i in range(1, len(cu_seqlens)):
-                attention_mask[..., cu_seqlens[i - 1]: cu_seqlens[i], cu_seqlens[i - 1]: cu_seqlens[i]] = 0
+            if pixel_values is not None:
+                attention_mask = torch.full(
+                    [1, seq_len, seq_len], torch.finfo(pixel_values.dtype).min, device=pixel_values.device,
+                    dtype=torch.bool
+                )
+                if cu_seqlens is not None:
+                    for i in range(1, len(cu_seqlens)):
+                        attention_mask[..., cu_seqlens[i - 1]: cu_seqlens[i], cu_seqlens[i - 1]: cu_seqlens[i]] = 0
+            else:
+                attention_mask = None
 
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
             cu_seqlens = cu_seqlens[1:]
@@ -566,12 +580,13 @@ class Qwen2VLViT(MultiModalModule):
 
         if mpu.get_context_parallel_world_size() > 1:
             split_gather_sizes = cal_split_sizes(hidden_states.shape[0], mpu.get_context_parallel_world_size())
-            rotary_pos_emb = split_forward_gather_backward(
-                rotary_pos_emb,
-                mpu.get_context_parallel_group(),
-                dim=0,
-                split_sizes=split_gather_sizes
-            )
+            if rotary_pos_emb is not None:
+                rotary_pos_emb = split_forward_gather_backward(
+                    rotary_pos_emb,
+                    mpu.get_context_parallel_group(),
+                    dim=0,
+                    split_sizes=split_gather_sizes
+                )
             hidden_states = split_forward_gather_backward(
                 hidden_states,
                 mpu.get_context_parallel_group(),
@@ -606,9 +621,10 @@ class Qwen2VLViT(MultiModalModule):
                     shift=True
                     )
 
-        cos_cache = rotary_pos_emb.cos().unsqueeze(1).repeat(1, 1, 2).unsqueeze(1).float()
-        sin_cache = rotary_pos_emb.sin().unsqueeze(1).repeat(1, 1, 2).unsqueeze(1).float()
-        rotary_pos_emb = torch.concat((cos_cache, sin_cache), dim=0)
+        if rotary_pos_emb is not None:
+            cos_cache = rotary_pos_emb.cos().unsqueeze(1).repeat(1, 1, 2).unsqueeze(1).float()
+            sin_cache = rotary_pos_emb.sin().unsqueeze(1).repeat(1, 1, 2).unsqueeze(1).float()
+            rotary_pos_emb = torch.concat((cos_cache, sin_cache), dim=0)
         hidden_states = self.blocks(
             hidden_states=hidden_states,
             rotary_pos_emb=rotary_pos_emb,

@@ -209,27 +209,21 @@ class MMGPTModel(LanguageModule):
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
-    ) -> Tensor:
-        """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoeder and finally into the post
-        processing layer (optional).
-
-        It either returns the Loss values if labels are given  or the final hidden units
+        output_hidden_states: bool = False,
+    ) -> Union[Tensor, Dict[str, Tensor]]:
+        """GPT 模型的前向传播函数：依次经过 embedding、decoder 和可选的输出层。
+        若提供 labels 则返回损失，否则返回最终隐藏状态或 logits。
         """
-        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
-        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
-
-        # Decoder embedding.
+        # 1. 准备 decoder 输入：若外部已提供 decoder_input 则直接使用；否则由 embedding 层生成。
         if decoder_input is not None:
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
         else:
-            # intermediate stage of pipeline
-            # decoder will get hidden_states from encoder.input_tensor
+            # 非首段 pipeline stage，decoder 输入由上游传入
             decoder_input = None
 
-        # Consider CP split, calculate actual length before splitting
+        # 2. 若开启 remove_padding，先根据 position_ids 计算实际序列长度，供后续算子使用
         if getattr(self.config, 'use_remove_padding', False):
             if position_ids is not None and position_ids.dim() == 3:
                 position_ids_fa = position_ids[0]
@@ -243,10 +237,12 @@ class MMGPTModel(LanguageModule):
             )
             set_actual_seq_len(tuple(cu_seqlens[1:].cpu().numpy().tolist()))
 
+        # 3. 若启用 Context Parallel（CP），按算法将输入拆分到不同 rank
         if mpu.get_context_parallel_world_size() > 1:
             split_gather_sizes = cal_split_sizes(input_ids.shape[-1], mpu.get_context_parallel_world_size())
 
             if get_args().context_parallel_algo == "ulysses_cp_algo":
+                # Ulysses CP：按 seq 维度切分
                 input_ids = split_forward_gather_backward(input_ids, mpu.get_context_parallel_group(), 1,
                                                             split_gather_sizes, "down")
                 position_ids = split_forward_gather_backward(position_ids, mpu.get_context_parallel_group(), 2,
@@ -256,6 +252,7 @@ class MMGPTModel(LanguageModule):
                                                                 split_gather_sizes, "down")
                     
             elif get_args().context_parallel_algo == "megatron_cp_algo":
+                # Megatron CP：按指定 dim 切分
                 input_ids = split_forward_gather_backward_with_megatron_cp(input_ids, mpu.get_context_parallel_group(), dim=1)
                 if position_ids is not None:
                     position_ids = split_forward_gather_backward_with_megatron_cp(position_ids, mpu.get_context_parallel_group(), dim=2)
@@ -263,6 +260,7 @@ class MMGPTModel(LanguageModule):
                     decoder_input = split_forward_gather_backward_with_megatron_cp(decoder_input, mpu.get_context_parallel_group(), dim=0)
 
             elif get_args().context_parallel_algo == "hybrid_cp_algo":
+                # 混合 CP：先 Ulysses 再 Megatron
                 seq_len = input_ids.shape[-1]
                 split_gather_sizes = cal_split_sizes(seq_len, get_context_parallel_for_hybrid_ulysses_world_size())
 
@@ -277,11 +275,11 @@ class MMGPTModel(LanguageModule):
                     decoder_input = split_forward_gather_backward(decoder_input, get_context_parallel_group_for_hybrid_ulysses(), 0, split_gather_sizes, "down")
                     decoder_input = split_forward_gather_backward_with_megatron_cp(decoder_input, get_context_parallel_group_for_hybrid_ring(), dim=0)
 
-        # sp must be after cp
+        # 4. 若开启 Sequence Parallel（SP），在 CP 之后将 decoder_input 打散到 TP 组
         if self.config.sequence_parallel and self.pre_process:
             decoder_input = scatter_to_sequence_parallel_region(decoder_input)
 
-        # Rotary positional embeddings (embedding is None for PP intermediate devices)
+        # 5. 生成旋转位置编码（RoPE / mRoPE）
         rotary_pos_emb = None
         if self.position_embedding_type == 'mrope':
             param_dtype = torch.bfloat16
@@ -295,6 +293,7 @@ class MMGPTModel(LanguageModule):
                 cos, sin = rotary_pos_emb[..., :half_dim], rotary_pos_emb[..., half_dim:]
                 rotary_pos_emb = torch.cat([cos, sin], dim=0)
             else:
+                # qwen2vl 默认分支：按 mrope_section 重组 cos/sin
                 rotary_pos_emb = self.rotary_pos_emb(input_ids.device, param_dtype, position_ids)
                 half_dim = rotary_pos_emb.shape[-1] // 2
                 cos, sin = rotary_pos_emb[..., :half_dim], rotary_pos_emb[..., half_dim:]
@@ -308,7 +307,7 @@ class MMGPTModel(LanguageModule):
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
-        # Run decoder.
+        # 6. 经过 decoder 层计算隐藏状态
         hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
@@ -318,20 +317,25 @@ class MMGPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
+        # 7. 若非最后阶段或仅 reward 模式，直接返回隐藏状态
         if not self.post_process or self.reward_process:
             return hidden_states
 
-        # logits and loss
+        # 8. 输出层计算 logits；若提供 labels 则计算损失
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
         logits, _ = self.output_layer(hidden_states, weight=output_weight)
 
         if labels is None:
-            return logits.transpose(0, 1).contiguous()
+            # 推理/生成阶段：转置后返回 logits；按需返回隐藏状态
+            logits = logits.transpose(0, 1).contiguous()
+            if output_hidden_states:
+                return {"logits": logits, "hidden_states": hidden_states}
+            return logits
 
+        # 训练阶段：计算语言模型损失
         loss = self.compute_language_model_loss(labels, logits)
-
         return loss
 
     def sharded_state_dict(
