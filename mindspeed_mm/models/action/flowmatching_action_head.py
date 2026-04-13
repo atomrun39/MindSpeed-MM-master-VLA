@@ -32,6 +32,12 @@ def _to_dict(config):
         return dict(config)
     if hasattr(config, "items"):
         return dict(config.items())
+    # Support argparse/pydantic/custom config objects that expose attributes but no items()
+    if hasattr(config, "__dict__"):
+        return {
+            k: v for k, v in vars(config).items()
+            if not k.startswith("_")
+        }
     return {}
 
 
@@ -88,11 +94,11 @@ class FlowmatchingActionHead(nn.Module):
             diffusion_cfg["interleave_self_attention"] = False
 
         self.model = DiT(**diffusion_cfg)
-        self.vl_proj = (
-            nn.Identity()
-            if text_hidden_size == self.model.inner_dim
-            else nn.Linear(text_hidden_size, self.model.inner_dim, bias=False)
-        )
+        use_vl_proj = bool(_cfg_get(config, "use_vl_proj", True))
+        if (not use_vl_proj) or (text_hidden_size == self.model.inner_dim):
+            self.vl_proj = nn.Identity()
+        else:
+            self.vl_proj = nn.Linear(text_hidden_size, self.model.inner_dim, bias=False)
         self.state_encoder = (
             MLP(self.state_dim, self.hidden_size, self.model.inner_dim)
             if self.state_dim > 0

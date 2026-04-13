@@ -22,6 +22,7 @@
 - `action_head.type` 可选普通 MLP 或 flowmatching，分别对应不同 loss 定义。
 - 评估阶段可显式计算 `action_loss`，不再局限于 `model.train()` 场景。
 - 首个 batch 进行维度契约检查（`action/state` vs action head 配置）。
+- 训练态默认不强制返回 `action_pred`（节省开销）；评估或显式 `return_action_pred=true` 时返回预测动作。
 
 ## 2. 三者关系说明
 
@@ -200,6 +201,9 @@ if action_loss is not None:
     # 作为主损失回传
     return action_loss, loss_dir
 ```
+
+补充：
+- 在 `forward_step` 中，`dataset_type=rlds_vla` 会自动注入 `compute_action_loss=True`，并触发首批 batch 契约校验。
 
 ## 6. 配置建议（正式训练）
 

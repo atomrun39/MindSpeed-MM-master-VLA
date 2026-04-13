@@ -1,6 +1,6 @@
-# Action Head 接入改造记录（不含 Action Loss）
+# Action Head 接入改造记录（含当前 Action Loss 现状）
 
-本文档记录在 MindSpeed-MM 中完成的 action head 接入改造，目标是打通 `forward -> action_pred`，并保持现有 LM loss 训练链路不变。
+本文档记录在 MindSpeed-MM 中完成的 action head 接入改造，并补充当前代码现状（已接入 action loss 主训练路径）。
 
 文档重点说明：
 
@@ -12,14 +12,14 @@
 ## 1. 改造目标
 
 - 在已有 RLDS VLA 数据链路基础上，把 `action/state` 对应的预测头接到模型中。
-- 在不引入 action loss 的前提下，先输出动作预测张量 `action_pred`。
+- 先完成 `forward -> action_pred` 链路，再在当前实现中接入 `action_loss` 训练主路径。
 - 兼容 Megatron PP/TP/CP 训练范式，尽量避免影响既有 VLM 训练逻辑。
 
 ## 2. 关键设计说明
 
 ### 2.1 设计原则
 
-1. **最小侵入**：不改 `pretrain_vlm.py` 的 loss 计算主逻辑，仅在输出中补充 `action_pred`。  
+1. **阶段化接入**：Phase-1 先最小侵入打通 `action_pred`，当前代码已在 `pretrain_vlm.py` 接入 `action_loss` 优先路径。  
 2. **配置驱动**：通过 `mm-model.json` 的 `action_head` 段控制行为。  
 3. **并行友好**：只在 `post_process=True` 的最后 text stage 持有并执行 action head，避免 PP 重复构建。  
 4. **向后兼容**：`action_head.enable=false` 时，行为应等价于原始 VLM。
@@ -116,16 +116,17 @@ def forward(self, hidden_states: torch.Tensor, state: Optional[torch.Tensor] = N
    - 调用 `self.action_head(hidden_states, state=...)`
    - 将 `action_pred` 合并进返回字典。
 
-### 3.4 训练入口兼容性结论
+### 3.4 训练入口当前行为（与最新代码对齐）
 
 文件：`pretrain_vlm.py`
 
-当前 `loss_func` 仅依赖：
+当前 `pretrain_vlm.py::loss_func` 行为：
 
-- `output_tensor["loss_dict"]`
-- `output_tensor["logits"]`（`log_tps` 场景）
+- 若 `output_tensor["action_loss"]` 存在：优先以 `action_loss` 作为反传损失；
+- 同时可记录 `loss_dict["loss"]` 为 `lm_loss` 日志（若存在）；
+- 若 `action_loss` 不存在：回退到原有 `loss_dict["loss"]` 路径。
 
-因此 `output_tensor` 增加 `action_pred` 不会破坏现有 loss 路径，无需改训练主循环。
+因此当前训练并非“只消费 `loss_dict/logits`”，而是对 VLA 场景优先消费 `action_loss`。
 
 ## 4. 端到端调用链（配置到 action_pred）
 
@@ -141,7 +142,7 @@ graph TD
   F --> G[ActionHead.forward(hidden_states, state)]
   G --> H[action_pred: B x action_horizon x action_dim]
   H --> I[output_tensor: loss_dict/logits/action_pred]
-  I --> J[pretrain_vlm.py loss_func 继续只消费 loss_dict/logits]
+  I --> J[pretrain_vlm.py loss_func: 优先 action_loss, 回退 loss_dict]
 ```
 
 ### 4.2 关键代码锚点
@@ -222,10 +223,10 @@ MindSpeed-MM 的 PP 场景下，每个 stage 只持有局部子模块。
 - 避免每个 stage 重复创建 action head 参数
 - 输入 hidden states 与 logits 同源，更容易保证形状一致性
 
-### 5.3 为什么训练入口不改 loss
+### 5.3 历史说明：为什么 Phase-1 当时不改 loss
 
-本阶段目标是先打通预测链路，不引入 action loss。  
-将 action_pred 透传出来后，后续同事可直接在 `forward_step/loss_func` 或新任务入口中增量接入损失，不需要回改模型结构。
+Phase-1 的目标是先打通预测链路，不引入 action loss。  
+当前代码已经在 `forward_step/loss_func` 中完成了 action loss 主路径接入，本节作为历史背景保留。
 
 ## 6. 配置示例（建议）
 
@@ -280,8 +281,8 @@ MindSpeed-MM 的 PP 场景下，每个 stage 只持有局部子模块。
 | `MMGPTModel.forward`（`labels is None`, `output_hidden_states=True`） | 不支持该模式 | `{"logits","hidden_states"}` | `logits: [B, S, V]`，`hidden_states: [S, B, H]`（sbh） | 为 action head 提供特征 |
 | `VLMModel.forward`（`post_process=True`, 无 labels, `action_head.enable=false`） | `{"loss": None, "logits": ...}` | `{"loss": None, "logits": ..., "action_pred": None}` | `logits: [B, S, V]` | 向后兼容，`action_pred` 为空 |
 | `VLMModel.forward`（`post_process=True`, 无 labels, `action_head.enable=true`） | 不支持 action 输出 | `{"loss": None, "logits": ..., "action_pred": ...}` | `action_pred: [B, AH, AD]` | 新增动作预测 |
-| `VLMModel.forward`（`post_process=True`, 有 labels） | `{"loss_dict","logits"}` | `{"loss_dict","logits","action_pred"}` | `loss_dict["loss"]` 标量；`action_pred: [B, AH, AD]` 或 `None` | 现有 LM loss 路径保持不变 |
-| `pretrain_vlm.py -> loss_func` 消费字段 | `loss_dict/logits` | `loss_dict/logits` | 与改造前一致 | `action_pred` 仅透传，不参与 loss |
+| `VLMModel.forward`（`post_process=True`, 有 labels） | `{"loss_dict","logits"}` | `{"loss_dict","logits","action_pred","action_loss"}` | `loss_dict["loss"]` 标量；`action_loss` 标量或 `None`；`action_pred` 训练时默认 `None`（可选返回） | action loss 由 action head 按条件计算 |
+| `pretrain_vlm.py -> loss_func` 消费字段 | `loss_dict/logits` | `action_loss` 优先，缺失时回退 `loss_dict` | VLA 场景主损失为 action_loss | `lm_loss` 可作为日志保留 |
 
 补充：
 
@@ -382,9 +383,9 @@ python -m compileall \
 
 ## 11. 已知边界与注意事项
 
-### 11.1 当前还没有 action loss
+### 11.1 当前已接入 action loss（更新）
 
-这是阶段性设计，不是遗漏。`action_pred` 已透传，后续可独立接 loss。
+当前实现已接入 action loss 主训练路径（VLA 场景），本节原“未接入”结论已过期。
 
 ### 11.2 现有 UnifoLM-VLA checkpoint 不能直接无改造继续训
 
@@ -445,7 +446,7 @@ python -m compileall \
 
 说明：
 
-- `action_loss` 目前仅透传，默认训练主循环仍按原 LM loss 工作。
+- `action_loss` 当前已被训练主循环优先消费（VLA 场景）。
 - 这保证了与“同事负责 action loss 主集成”的并行开发边界一致。
 
 ### 13.4 最小可跑配置样例（flowmatching）
@@ -547,8 +548,8 @@ flowchart TD
   loss_dict, logits, action_pred, action_loss(可选)"]
 
   J["loss_func
-  当前默认只消费 loss_dict/logits
-  （后续可并入 action_loss）"]
+  当前优先消费 action_loss
+  缺失时回退 loss_dict"]
 
   K["反向传播与优化器更新"]
 
@@ -574,7 +575,7 @@ flowchart TD
    使用 `hidden_states`（可选融合 `state`）得到 `action_pred`；flow-matching 模式可额外计算 `action_loss`。
 
 6. **loss 与训练更新**  
-   当前主循环默认使用 LM loss；`action_pred/action_loss` 已在输出中，后续可直接接入联合训练。
+   当前 VLA 主循环优先使用 `action_loss`；无 `action_loss` 时回退到 LM loss。
 
 ## 15. 与 UnifoLM 训练损失策略对齐说明
 

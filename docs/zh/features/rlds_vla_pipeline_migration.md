@@ -36,6 +36,11 @@
 
 后续模型与 loss 推荐优先依赖这些标准字段，避免耦合到底层 RLDS 原始字段名。
 
+- `DataCollatorForVLASequence` 兼容输入别名：
+  - `action` 不存在时会回退读取 `actions`
+  - `state` 不存在时会回退读取 `proprio`
+- `state` 允许为 `None`（例如关闭 proprio 时）
+
 
 ## 3. 改动总览
 
@@ -66,6 +71,11 @@
     - `register_batch_transform_builder`
     - `build_batch_transform`
   - 默认注册：`qwen2vl`
+- 新增行为：
+  - 支持环境变量覆盖数据源：
+    - `VLA_DATA_ROOT_DIR` 或 `OXE_DATA_ROOT` 覆盖 `basic_parameters.data_root_dir`
+    - `VLA_DATA_MIX` 或 `DATA_MIX` 覆盖 `basic_parameters.data_mix`
+  - 在懒加载 RLDS 核心类前会做 TensorFlow 运行时校验（要求 `tensorflow` 模块存在且包含 `tf.image`）
 
 ### 3.4 新增通用 VLA Collator
 
@@ -85,6 +95,8 @@
   - 生成 `attention_mask`
   - 拼接 `pixel_values`、`image_grid_thw`
   - stack `action`、`state`
+- 新增行为：
+  - 支持 `fixed_seq_length`：当配置或全局参数存在 `seq_length` 时，会对 `input_ids` 做截断/右侧补齐到固定长度
 
 
 ### 3.5 新增 RLDS 运行依赖
@@ -404,6 +416,12 @@ dataset = (
 }
 ```
 
+补充说明（与当前实现一致）：
+- 训练脚本中如设置了
+  - `VLA_DATA_ROOT_DIR` / `OXE_DATA_ROOT`
+  - `VLA_DATA_MIX` / `DATA_MIX`
+  则会覆盖上面 `data_root_dir` 与 `data_mix` 的 JSON 配置值。
+
 ## 8. 本地 RLDS 加载验证方法
 
 ### 8.1 环境准备
@@ -505,6 +523,14 @@ pip install "setuptools<82"
 
 - 这是 MindSpeed 补丁初始化链路问题，不是 RLDS 逻辑问题
 - 纯数据调试时先设置 `NON_MEGATRON=true`
+
+### 9.3 TensorFlow 运行时不完整导致 RLDS 初始化失败
+
+- 现象：`rlds_vla_dataset` 初始化时报 TensorFlow 运行时异常，提示 `has_tf_image=False`
+- 原因：环境中存在被裁剪/被同名模块覆盖的 TensorFlow，缺少 `tf.image`
+- 解决：
+  - 安装完整 TensorFlow 发行版（`tensorflow` 或 `tensorflow-cpu`）
+  - 检查工程目录下是否有同名 `tensorflow.py` 造成模块遮蔽
 
 
 ## 10. 后续计划
